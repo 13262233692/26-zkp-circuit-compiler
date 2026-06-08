@@ -1,7 +1,10 @@
 pub mod ast;
 pub mod error;
 pub mod flattener;
+pub mod groth16;
 pub mod lexer;
 pub mod parser;
 pub mod r1cs;
+pub mod secure_memory;
 pub mod serializer;
+pub mod setup;

@@ -11,10 +11,11 @@ use zkp_circuit_compiler::lexer::Lexer;
 use zkp_circuit_compiler::parser::Parser as CircuitParser;
 use zkp_circuit_compiler::r1cs::bn128_prime;
 use zkp_circuit_compiler::serializer;
+use zkp_circuit_compiler::setup::{self, SetupConfig};
 
 #[derive(Parser)]
 #[command(name = "zkp-circuit-compiler")]
-#[command(about = "Hardcore ZKP circuit compiler: source → AST → R1CS → .r1cs binary")]
+#[command(about = "Hardcore ZKP circuit compiler: source → AST → R1CS → Groth16 CRS")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -42,6 +43,16 @@ enum Commands {
     DumpAst {
         #[arg(help = "Input source file (.zkp)")]
         input: PathBuf,
+    },
+    Setup {
+        #[arg(help = "Input .r1cs binary file (from compile step)")]
+        input: PathBuf,
+        #[arg(long, help = "Output proving key file (.pk)")]
+        output_pk: Option<PathBuf>,
+        #[arg(long, help = "Output verification key file (.vk)")]
+        output_vk: Option<PathBuf>,
+        #[arg(short, long, default_value = "3", help = "Number of MPC participants")]
+        participants: usize,
     },
 }
 
@@ -94,9 +105,93 @@ fn compile_file(
     let mut out_file = fs::File::create(&output_path)?;
     serializer::serialize(&system, &mut out_file)?;
 
-    eprintln!("Done! Generated {} constraints over {} variables.", 
+    eprintln!("Done! Generated {} constraints over {} variables.",
         system.constraints.len(), system.num_variables);
     eprintln!("Output: {}", output_path.display());
+
+    Ok(())
+}
+
+fn run_setup(
+    input: &PathBuf,
+    output_pk: &Option<PathBuf>,
+    output_vk: &Option<PathBuf>,
+    participants: usize,
+) -> Result<()> {
+    let data = fs::read(input)?;
+    if data.len() < 12 || &data[0..4] != b"r1cs" {
+        return Err(zkp_circuit_compiler::error::CompileError::SerializeError {
+            message: "invalid .r1cs file".to_string(),
+        });
+    }
+
+    let (num_constraints, num_variables) = {
+        let mut offset = 12;
+        let mut _sect_type = 0u32;
+        let mut found_header = false;
+        let mut n_constraints = 0usize;
+        let mut n_vars = 0usize;
+
+        for _ in 0..4 {
+            if offset + 12 > data.len() { break; }
+            _sect_type = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            let sect_len = u64::from_le_bytes(data[offset + 4..offset + 12].try_into().unwrap()) as usize;
+            offset += 12;
+
+            if _sect_type == 0 && !found_header {
+                found_header = true;
+                let s = &data[offset..offset + sect_len];
+                let fs = u32::from_le_bytes(s[0..4].try_into().unwrap()) as usize;
+                let mut p = 4 + fs;
+                n_vars = u32::from_le_bytes(s[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let _n_outputs = u32::from_le_bytes(s[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let _n_pub_inputs = u32::from_le_bytes(s[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let _n_priv_inputs = u32::from_le_bytes(s[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let _n_labels = u64::from_le_bytes(s[p..p + 8].try_into().unwrap());
+                p += 8;
+                n_constraints = u32::from_le_bytes(s[p..p + 4].try_into().unwrap()) as usize;
+            }
+            offset += sect_len;
+        }
+
+        if !found_header {
+            return Err(zkp_circuit_compiler::error::CompileError::SerializeError {
+                message: "no header section found in .r1cs file".to_string(),
+            });
+        }
+        (n_constraints, n_vars)
+    };
+
+    let pk_path = match output_pk {
+        Some(p) => p.clone(),
+        None => input.with_extension("pk"),
+    };
+    let vk_path = match output_vk {
+        Some(p) => p.clone(),
+        None => input.with_extension("vk"),
+    };
+
+    let config = SetupConfig {
+        num_constraints,
+        num_variables,
+        mpc_participants: participants,
+        output_pk: pk_path,
+        output_vk: vk_path,
+    };
+
+    let result = setup::run_trusted_setup(&config)?;
+
+    println!();
+    println!("Trusted setup completed successfully:");
+    println!("  Participants:  {}", result.participant_count);
+    println!("  PK file size:  {} bytes", result.pk_size);
+    println!("  VK file size:  {} bytes", result.vk_size);
+    println!("  Memory locked: {}", result.memory_locked);
+    println!("  Memory zeroed: {}", result.memory_zeroed);
 
     Ok(())
 }
@@ -137,6 +232,12 @@ fn main() {
         } => compile_file(&input, &output, show_ast, show_r1cs, &prime),
         Commands::Inspect { input } => inspect_file(&input),
         Commands::DumpAst { input } => dump_ast(&input),
+        Commands::Setup {
+            input,
+            output_pk,
+            output_vk,
+            participants,
+        } => run_setup(&input, &output_pk, &output_vk, participants),
     };
 
     if let Err(e) = result {

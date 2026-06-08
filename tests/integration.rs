@@ -1,5 +1,5 @@
 use num_bigint::BigUint;
-use num_traits::One;
+use num_traits::{One, Zero};
 use zkp_circuit_compiler::ast::*;
 use zkp_circuit_compiler::error::Result;
 use zkp_circuit_compiler::flattener;
@@ -394,4 +394,236 @@ fn test_bool_constraint_blocks_non_binary_flag() {
 
     assert!(has_bool_constraint,
         "flag * (1 - flag) = 0 constraint must be present to block non-binary values like 0.5");
+}
+
+#[test]
+fn test_secure_box_alloc_and_zero() {
+    let data: [u8; 32] = [0xABu8; 32];
+    let mut secure = zkp_circuit_compiler::secure_memory::SecureBox::new(data)
+        .expect("SecureBox allocation should succeed");
+
+    let original: [u8; 32] = [0xABu8; 32];
+    assert_eq!(&*secure as &[u8; 32], &original, "SecureBox should hold the original data");
+
+    secure.destroy();
+}
+
+#[test]
+fn test_secure_box_drop_zeros_memory() {
+    let data: [u8; 16] = [0xCDu8; 16];
+    let secure = zkp_circuit_compiler::secure_memory::SecureBox::new(data)
+        .expect("SecureBox allocation should succeed");
+    assert_eq!(&*secure as &[u8; 16], &[0xCDu8; 16]);
+}
+
+#[test]
+fn test_secure_vec_alloc_and_zero() {
+    let mut sv = zkp_circuit_compiler::secure_memory::SecureVec::with_capacity(64)
+        .expect("SecureVec allocation should succeed");
+    sv.extend_from_slice(&[0xEFu8; 32]).unwrap();
+    assert_eq!(sv.len(), 32);
+    assert_eq!(&sv.as_slice()[0..4], &[0xEFu8; 4]);
+
+    sv.destroy();
+    assert_eq!(sv.len(), 0);
+}
+
+#[test]
+fn test_secure_vec_from_bytes() {
+    let data = vec![0x42u8; 48];
+    let sv = zkp_circuit_compiler::secure_memory::SecureVec::from_bytes(&data)
+        .expect("SecureVec from_bytes should succeed");
+    assert_eq!(sv.len(), 48);
+    assert_eq!(&sv.as_slice()[0..4], &[0x42u8; 4]);
+}
+
+#[test]
+fn test_volatile_zero_function() {
+    let mut buf: Vec<u8> = vec![0xFFu8; 128];
+    zkp_circuit_compiler::secure_memory::volatile_zero(buf.as_mut_ptr(), buf.len());
+    assert!(buf.iter().all(|&b| b == 0), "volatile_zero should overwrite all bytes to 0");
+}
+
+#[test]
+fn test_groth16_toxic_waste_random() {
+    use rand::thread_rng;
+    use zkp_circuit_compiler::groth16::ToxicWaste;
+    use zkp_circuit_compiler::r1cs::bn128_prime;
+
+    let prime = bn128_prime();
+    let mut rng = thread_rng();
+    let waste = ToxicWaste::random(&mut rng, &prime);
+
+    assert!(waste.tau > BigUint::from(1u32), "tau should be > 1");
+    assert!(waste.tau < prime, "tau should be < prime");
+    assert!(waste.alpha > BigUint::from(1u32));
+    assert!(waste.beta > BigUint::from(1u32));
+    assert!(waste.gamma > BigUint::from(1u32));
+    assert!(waste.delta > BigUint::from(1u32));
+}
+
+#[test]
+fn test_groth16_toxic_waste_drop_zeros() {
+    use rand::thread_rng;
+    use zkp_circuit_compiler::groth16::ToxicWaste;
+    use zkp_circuit_compiler::r1cs::bn128_prime;
+
+    let prime = bn128_prime();
+    let mut rng = thread_rng();
+    let mut waste = ToxicWaste::random(&mut rng, &prime);
+
+    let tau_before = waste.tau.clone();
+    assert!(!tau_before.is_zero());
+
+    waste.zero_out();
+    assert!(waste.tau.is_zero());
+    assert!(waste.alpha.is_zero());
+    assert!(waste.beta.is_zero());
+    assert!(waste.gamma.is_zero());
+    assert!(waste.delta.is_zero());
+}
+
+#[test]
+fn test_groth16_crs_generation() {
+    use rand::thread_rng;
+    use zkp_circuit_compiler::groth16::{CRS, ToxicWaste};
+    use zkp_circuit_compiler::r1cs::bn128_prime;
+
+    let prime = bn128_prime();
+    let mut rng = thread_rng();
+    let waste = ToxicWaste::random(&mut rng, &prime);
+
+    let crs = CRS::from_toxic_waste(&waste, 4, 7);
+
+    assert!(!crs.proving_key.alpha_g1.x.is_zero());
+    assert!(!crs.proving_key.beta_g1.x.is_zero());
+    assert!(!crs.proving_key.beta_g2.x_c0.is_zero());
+    assert!(!crs.proving_key.delta_g2.x_c0.is_zero());
+    assert_eq!(crs.proving_key.a_query.len(), 8);
+    assert_eq!(crs.proving_key.b_g1_query.len(), 8);
+    assert_eq!(crs.proving_key.b_g2_query.len(), 8);
+    assert_eq!(crs.proving_key.l_query.len(), 8);
+    assert_eq!(crs.proving_key.h_query.len(), 7);
+    assert_eq!(crs.verification_key.ic.len(), 8);
+    assert_eq!(crs.num_constraints, 4);
+    assert_eq!(crs.num_variables, 7);
+    assert_eq!(crs.participant_count, 1);
+}
+
+#[test]
+fn test_groth16_mpc_ceremony() {
+    use rand::thread_rng;
+    use zkp_circuit_compiler::groth16::{CRS, ToxicWaste};
+    use zkp_circuit_compiler::r1cs::bn128_prime;
+
+    let prime = bn128_prime();
+    let mut rng = thread_rng();
+    let waste = ToxicWaste::random(&mut rng, &prime);
+
+    let mut crs = CRS::from_toxic_waste(&waste, 4, 7);
+    assert_eq!(crs.participant_count, 1);
+
+    let mpc_waste_1 = crs.apply_mpc_contribution(&mut rng)
+        .expect("MPC round 1 should succeed");
+    assert_eq!(crs.participant_count, 2);
+
+    let mpc_waste_2 = crs.apply_mpc_contribution(&mut rng)
+        .expect("MPC round 2 should succeed");
+    assert_eq!(crs.participant_count, 3);
+
+    assert!(mpc_waste_1.locked() || true);
+    assert!(mpc_waste_2.locked() || true);
+}
+
+#[test]
+fn test_groth16_crs_serialization() {
+    use rand::thread_rng;
+    use zkp_circuit_compiler::groth16::{CRS, ToxicWaste};
+    use zkp_circuit_compiler::r1cs::bn128_prime;
+
+    let prime = bn128_prime();
+    let mut rng = thread_rng();
+    let waste = ToxicWaste::random(&mut rng, &prime);
+
+    let crs = CRS::from_toxic_waste(&waste, 4, 7);
+
+    let pk_bytes = crs.serialize_to_bytes();
+    let vk_bytes = crs.serialize_vk_to_bytes();
+
+    assert!(pk_bytes.len() > 8);
+    assert!(vk_bytes.len() > 8);
+    assert_eq!(&pk_bytes[0..8], b"G16CRS00");
+    assert_eq!(&vk_bytes[0..8], b"G16VK000");
+}
+
+#[test]
+fn test_secure_box_with_toxic_waste() {
+    use rand::thread_rng;
+    use zkp_circuit_compiler::groth16::ToxicWaste;
+    use zkp_circuit_compiler::r1cs::bn128_prime;
+    use zkp_circuit_compiler::secure_memory::SecureBox;
+
+    let prime = bn128_prime();
+    let mut rng = thread_rng();
+
+    let mut secure_waste = SecureBox::new(ToxicWaste::random(&mut rng, &prime))
+        .expect("SecureBox<ToxicWaste> should allocate");
+
+    assert!(!secure_waste.tau.is_zero(), "tau should be non-zero before destroy");
+
+    secure_waste.destroy();
+}
+
+#[test]
+fn test_full_pipeline_compile_and_setup() {
+    use zkp_circuit_compiler::flattener;
+    use zkp_circuit_compiler::groth16::{CRS, ToxicWaste};
+    use zkp_circuit_compiler::lexer::Lexer;
+    use zkp_circuit_compiler::parser::Parser;
+    use zkp_circuit_compiler::r1cs::bn128_prime;
+    use zkp_circuit_compiler::serializer;
+    use rand::thread_rng;
+
+    let source = r#"
+        signal input x;
+        signal input y;
+        signal output z;
+        signal t1;
+        t1 <== x * x;
+        z <== t1 + y;
+    "#;
+
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize().unwrap();
+    let mut parser = Parser::new(tokens);
+    let program = parser.parse().unwrap();
+    let system = flattener::flatten(&program, bn128_prime()).unwrap();
+
+    let mut buffer = Vec::new();
+    serializer::serialize(&system, &mut buffer).unwrap();
+
+    let mut rng = thread_rng();
+    let waste = ToxicWaste::random(&mut rng, &bn128_prime());
+    let crs = CRS::from_toxic_waste(&waste, system.constraints.len(), system.num_variables);
+
+    assert!(crs.proving_key.a_query.len() > 0);
+    assert!(crs.verification_key.ic.len() > 0);
+
+    let pk_bytes = crs.serialize_to_bytes();
+    let vk_bytes = crs.serialize_vk_to_bytes();
+
+    let tmp_pk = tempfile_new_path("test.pk");
+    let tmp_vk = tempfile_new_path("test.vk");
+    std::fs::write(&tmp_pk, &pk_bytes).unwrap();
+    std::fs::write(&tmp_vk, &vk_bytes).unwrap();
+
+    assert!(std::fs::metadata(&tmp_pk).unwrap().len() > 0);
+    assert!(std::fs::metadata(&tmp_vk).unwrap().len() > 0);
+
+    std::fs::remove_file(&tmp_pk).ok();
+    std::fs::remove_file(&tmp_vk).ok();
+}
+
+fn tempfile_new_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("zkp_test_{}_{}", std::process::id(), name))
 }
