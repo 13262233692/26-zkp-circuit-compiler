@@ -1,6 +1,7 @@
+use std::collections::{HashMap, HashSet};
+
 use num_bigint::BigUint;
 use num_traits::One;
-use std::collections::HashMap;
 
 use crate::ast::{Expr, Program, SignalKind, Statement};
 use crate::error::{CompileError, Result};
@@ -9,6 +10,7 @@ use crate::r1cs::{LinearCombination, R1csSystem};
 struct Flattener {
     system: R1csSystem,
     signal_map: HashMap<String, usize>,
+    bool_constrained: HashSet<String>,
     temp_counter: usize,
 }
 
@@ -17,6 +19,7 @@ impl Flattener {
         Flattener {
             system: R1csSystem::new(prime),
             signal_map: HashMap::new(),
+            bool_constrained: HashSet::new(),
             temp_counter: 0,
         }
     }
@@ -72,6 +75,24 @@ impl Flattener {
         }
     }
 
+    fn enforce_boolean(&mut self, name: &str) -> Result<()> {
+        if self.bool_constrained.contains(name) {
+            return Ok(());
+        }
+        let idx = *self.signal_map.get(name).ok_or_else(|| {
+            CompileError::R1csError {
+                message: format!("undefined signal: {}", name),
+            }
+        })?;
+        let lc = LinearCombination::from_var(idx);
+        let one_lc = LinearCombination::from_constant(BigUint::one());
+        let one_minus_lc = one_lc.sub(&lc, &self.system.prime);
+        let zero_lc = LinearCombination::new();
+        self.system.add_constraint(lc, one_minus_lc, zero_lc);
+        self.bool_constrained.insert(name.to_string());
+        Ok(())
+    }
+
     fn flatten_statement(&mut self, stmt: &Statement) -> Result<()> {
         match stmt {
             Statement::SignalDecl(decl) => {
@@ -115,13 +136,7 @@ impl Flattener {
                 Ok(())
             }
             Statement::AssertBool(name) => {
-                let idx = self.signal_map.get(name).ok_or_else(|| {
-                    CompileError::R1csError {
-                        message: format!("undefined signal: {}", name),
-                    }
-                })?;
-                let lc = LinearCombination::from_var(*idx);
-                self.system.add_constraint(lc.clone(), lc.clone(), lc);
+                self.enforce_boolean(name)?;
                 Ok(())
             }
             Statement::Conditional {
@@ -129,6 +144,8 @@ impl Flattener {
                 then_stmt,
                 else_stmt,
             } => {
+                self.enforce_boolean(condition)?;
+
                 let cond_idx = *self.signal_map.get(condition).ok_or_else(|| {
                     CompileError::R1csError {
                         message: format!("undefined signal: {}", condition),

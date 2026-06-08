@@ -172,9 +172,13 @@ fn test_r1cs_boolean_constraint() {
     assert_eq!(system.constraints.len(), 1);
     let constraint = &system.constraints[0];
     let flag_idx = 1;
+    let prime = bn128_prime();
+    let neg_one = &prime - BigUint::one();
+
     assert_eq!(constraint.a.terms.get(&flag_idx), Some(&BigUint::one()));
-    assert_eq!(constraint.b.terms.get(&flag_idx), Some(&BigUint::one()));
-    assert_eq!(constraint.c.terms.get(&flag_idx), Some(&BigUint::one()));
+    assert_eq!(constraint.b.terms.get(&0), Some(&BigUint::one()));
+    assert_eq!(constraint.b.terms.get(&flag_idx), Some(&neg_one));
+    assert!(constraint.c.terms.is_empty());
 }
 
 #[test]
@@ -185,14 +189,14 @@ fn test_r1cs_conditional() {
     assert!(system.constraints.len() >= 2);
 
     let bool_constraint = &system.constraints[0];
-    assert_eq!(
-        bool_constraint.a.terms.get(&3),
-        Some(&BigUint::one())
-    );
-    assert_eq!(
-        bool_constraint.b.terms.get(&3),
-        Some(&BigUint::one())
-    );
+    let flag_idx = 3;
+    let prime = bn128_prime();
+    let neg_one = &prime - BigUint::one();
+
+    assert_eq!(bool_constraint.a.terms.get(&flag_idx), Some(&BigUint::one()));
+    assert_eq!(bool_constraint.b.terms.get(&0), Some(&BigUint::one()));
+    assert_eq!(bool_constraint.b.terms.get(&flag_idx), Some(&neg_one));
+    assert!(bool_constraint.c.terms.is_empty());
 }
 
 #[test]
@@ -289,4 +293,105 @@ fn test_parser_equality_constraint() {
     "#;
     let system = compile_to_r1cs(source).unwrap();
     assert_eq!(system.constraints.len(), 1);
+}
+
+#[test]
+fn test_conditional_auto_injects_bool_constraint() {
+    let source = r#"
+        signal input a;
+        signal output c;
+        signal flag;
+        if flag then c <== a;
+    "#;
+    let system = compile_to_r1cs(source).unwrap();
+
+    assert!(system.constraints.len() >= 2,
+        "conditional MUST auto-inject boolean constraint on flag, got {} constraints",
+        system.constraints.len());
+
+    let bool_constraint = &system.constraints[0];
+    let flag_idx = 3;
+    let prime = bn128_prime();
+    let neg_one = &prime - BigUint::one();
+
+    assert_eq!(bool_constraint.a.terms.get(&flag_idx), Some(&BigUint::one()),
+        "A side of bool constraint must be flag");
+    assert_eq!(bool_constraint.b.terms.get(&0), Some(&BigUint::one()),
+        "B side of bool constraint must contain constant 1");
+    assert_eq!(bool_constraint.b.terms.get(&flag_idx), Some(&neg_one),
+        "B side of bool constraint must contain -flag (i.e. 1-flag)");
+    assert!(bool_constraint.c.terms.is_empty(),
+        "C side of bool constraint must be 0");
+}
+
+#[test]
+fn test_no_duplicate_bool_constraint() {
+    let source = r#"
+        signal input a;
+        signal output c;
+        signal flag;
+        assert_bool(flag);
+        if flag then c <== a;
+    "#;
+    let system_with_assert = compile_to_r1cs(source).unwrap();
+
+    let source_no_assert = r#"
+        signal input a;
+        signal output c;
+        signal flag;
+        if flag then c <== a;
+    "#;
+    let system_no_assert = compile_to_r1cs(source_no_assert).unwrap();
+
+    assert_eq!(system_with_assert.constraints.len(), system_no_assert.constraints.len(),
+        "assert_bool + conditional must NOT produce duplicate boolean constraints");
+}
+
+#[test]
+fn test_conditional_else_auto_injects_bool() {
+    let source = r#"
+        signal input a;
+        signal input b;
+        signal output c;
+        signal flag;
+        if flag then c <== a;
+        else c <== b;
+    "#;
+    let system = compile_to_r1cs(source).unwrap();
+
+    assert!(system.constraints.len() >= 3,
+        "if-else must auto-inject 1 bool + 1 then + 1 else = 3 constraints, got {}",
+        system.constraints.len());
+
+    let bool_constraint = &system.constraints[0];
+    let flag_idx = 4;
+    let prime = bn128_prime();
+    let neg_one = &prime - BigUint::one();
+
+    assert_eq!(bool_constraint.a.terms.get(&flag_idx), Some(&BigUint::one()));
+    assert_eq!(bool_constraint.b.terms.get(&0), Some(&BigUint::one()));
+    assert_eq!(bool_constraint.b.terms.get(&flag_idx), Some(&neg_one));
+    assert!(bool_constraint.c.terms.is_empty());
+}
+
+#[test]
+fn test_bool_constraint_blocks_non_binary_flag() {
+    let source = r#"
+        signal input a;
+        signal output c;
+        signal flag;
+        if flag then c <== a;
+    "#;
+    let system = compile_to_r1cs(source).unwrap();
+
+    let bool_constraint = &system.constraints[0];
+    let flag_idx = 3;
+
+    let has_bool_constraint = bool_constraint.a.terms.get(&flag_idx).is_some()
+        && bool_constraint.b.terms.contains_key(&0)
+        && bool_constraint.b.terms.contains_key(&flag_idx)
+        && bool_constraint.c.terms.is_empty();
+
+    assert!(has_bool_constraint,
+        "flag * (1 - flag) = 0 constraint must be present to block non-binary values like 0.5");
 }
