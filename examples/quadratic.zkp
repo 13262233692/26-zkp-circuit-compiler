@@ -1,0 +1,10 @@
+signal input x;
+signal input y;
+signal output z;
+signal t1;
+signal t2;
+signal t3;
+t1 <== x * x;
+t2 <== y * y;
+t3 <== t1 + t2;
+z <== t3 * t3;

@@ -1,0 +1,6 @@
+signal input a;
+signal input b;
+signal output c;
+signal t1;
+t1 <== a * b;
+c <== t1 + a;

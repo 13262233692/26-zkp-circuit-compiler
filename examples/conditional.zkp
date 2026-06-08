@@ -1,0 +1,6 @@
+signal input a;
+signal input b;
+signal output c;
+signal flag;
+assert_bool(flag);
+if flag then c <== a;
